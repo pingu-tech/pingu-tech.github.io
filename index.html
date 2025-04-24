@@ -3,18 +3,9 @@
 
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Gemini Chat</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
-  <style>
-    #chat {
-      height: 300px;
-      overflow-y: auto;
-    }
-
-    .hidden {
-      display: none;
-    }
-  </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.3/css/bulma.min.css">
 </head>
 
 <body>
@@ -34,82 +25,178 @@
       </div>
 
       <!-- チャットUI -->
-      <div id="chatSection" class="hidden">
-        <div id="chat" class="box mb-3"></div>
-        <div class="field has-addons">
-          <div class="control is-expanded">
-            <input id="messageInput" class="input" type="text" placeholder="メッセージを入力…"
-              onkeydown="if(event.key==='Enter')sendMessage()">
-          </div>
+      <div id="chatSection" class="is-hidden">
+        <div id="chat" class="box mb-3" style="height: 500px; overflow-y: auto;"></div>
+        <!-- 入力エリアの構成を変更 -->
+        <div class="field">
           <div class="control">
-            <button class="button is-info" onclick="sendMessage()">送信</button>
+            <!-- input を textarea に変更 -->
+            <textarea id="messageInput" class="textarea" placeholder="メッセージを入力… (Shift+Enterで改行)" rows="3"
+              onkeydown="handleKeyDown(event)"></textarea>
           </div>
         </div>
-        <button class="button is-danger is-light mt-2" onclick="resetApiKey()">APIキーをリセット</button>
+        <div class="field is-grouped is-grouped-right">
+          <div class="control">
+            <button id="sendButton" class="button is-info" onclick="sendMessage()">送信</button>
+          </div>
+        </div>
+        <!-- APIキーリセットボタン -->
+        <button class="button is-danger is-light mt-4" onclick="resetApiKey()">APIキーをリセット</button>
       </div>
     </div>
   </section>
 
   <script>
     let userApiKey = "";
+    let conversationHistory = [];
+
+    // --- DOM要素の取得を最初に行う ---
+    const keySection = document.getElementById("keySection");
+    const chatSection = document.getElementById("chatSection");
+    const apiKeyInput = document.getElementById("apiKeyInput");
+    const chat = document.getElementById("chat");
+    const messageInput = document.getElementById("messageInput");
+    const sendButton = document.getElementById("sendButton"); // ボタンにIDを付与して取得
 
     window.onload = () => {
       const savedKey = localStorage.getItem("geminiApiKey");
       if (savedKey) {
         userApiKey = savedKey;
         showChatUI();
+      } else {
+        keySection.classList.remove("is-hidden");
       }
     };
 
     function saveApiKey() {
-      const input = document.getElementById("apiKeyInput").value;
-      if (!input) {
+      const inputKey = apiKeyInput.value;
+      if (!inputKey) {
         alert("APIキーを入力してください");
         return;
       }
-      userApiKey = input;
+      userApiKey = inputKey;
       localStorage.setItem("geminiApiKey", userApiKey);
       showChatUI();
     }
 
     function resetApiKey() {
       localStorage.removeItem("geminiApiKey");
+      conversationHistory = [];
       location.reload();
     }
 
     function showChatUI() {
-      document.getElementById("keySection").classList.add("hidden");
-      document.getElementById("chatSection").classList.remove("hidden");
+      keySection.classList.add("is-hidden");
+      chatSection.classList.remove("is-hidden");
+      messageInput.focus(); // チャット表示時にフォーカス
+    }
+
+    function handleKeyDown(event) {
+      // --- Enter送信、Shift+Enter改行の処理 ---
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        event.preventDefault(); // TextareaでのEnterキー既定の改行動作をキャンセル
+        sendMessage();
+      }
+      // Shift+Enterの場合は通常の改行動作
     }
 
     async function sendMessage() {
-      const input = document.getElementById("messageInput");
-      const chat = document.getElementById("chat");
-      const msg = input.value.trim();
+      const msg = messageInput.value.trim();
 
       if (!msg) return;
 
-      chat.innerHTML += `<p><strong>あなた:</strong> ${msg}</p>`;
-      input.value = "";
-      input.disabled = true;
+      // --- 見た目の変更: ユーザーメッセージ ---
+      appendMessage(msg, 'user');
+      messageInput.value = ""; // 送信後にクリア
+      messageInput.disabled = true;
+      sendButton.classList.add('is-loading');
+
+      conversationHistory.push({ role: "user", parts: [{ text: msg }] });
 
       try {
         const res = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=${userApiKey}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            contents: [{ parts: [{ text: msg }] }]
+            contents: conversationHistory
           })
         });
 
-        const data = await res.json();
-        const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "(返答なし)";
-        chat.innerHTML += `<p><strong>Gemini:</strong> ${reply}</p>`;
+        let responseText = ""; // 応答テキストを格納する変数
+
+        if (!res.ok) {
+          let errorData;
+          try {
+            errorData = await res.json();
+          } catch (e) {
+            errorData = { error: { message: `HTTPエラー: ${res.status}` } };
+          }
+          const errorMessage = errorData?.error?.message || '不明なAPIエラー';
+          console.error("API Error:", errorData);
+          // --- 見た目の変更: エラーメッセージ ---
+          appendMessage(`エラー: ${errorMessage}`, 'error');
+          conversationHistory.pop(); // エラー時はユーザーメッセージを履歴から削除
+        } else {
+          const data = await res.json();
+          // --- 安全な応答の取得 ---
+          responseText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "(返答なし)";
+          // --- 見た目の変更: Geminiメッセージ ---
+          appendMessage(responseText, 'gemini');
+          conversationHistory.push({ role: "model", parts: [{ text: responseText }] });
+        }
+
       } catch (e) {
-        chat.innerHTML += `<p class="has-text-danger">エラー: APIリクエストに失敗しました。</p>`;
+        console.error("Fetch Error:", e);
+        // --- 見た目の変更: エラーメッセージ ---
+        appendMessage(`エラー: APIリクエストに失敗しました。ネットワーク接続を確認してください。`, 'error');
+        conversationHistory.pop(); // エラー時はユーザーメッセージを履歴から削除
+      } finally {
+        messageInput.disabled = false;
+        sendButton.classList.remove('is-loading');
+        messageInput.focus();
+        // 送信後にTextareaの高さをリセット（任意）
+        messageInput.style.height = 'auto';
+        messageInput.rows = 3; // 初期行数に戻すなど
+      }
+    }
+
+    // --- appendMessage関数を役割に応じて変更 ---
+    function appendMessage(text, sender) {
+      const wasScrolledToBottom = chat.scrollHeight - chat.clientHeight <= chat.scrollTop + 1;
+
+      const messageElement = document.createElement('div');
+      messageElement.classList.add('mb-2'); // メッセージ間のマージン
+
+      const p = document.createElement('p');
+      p.classList.add('p-2'); // パディング
+      p.style.wordBreak = 'break-word'; // 長い単語の折り返し
+
+      // HTMLエスケープ (簡易版: < と > のみ)
+      const escapedText = text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+      if (sender === 'user') {
+        messageElement.classList.add('has-text-right'); // 右寄せ
+        p.classList.add('has-background-info-light'); // ユーザーの背景色
+        p.style.display = 'inline-block'; // 右寄せしつつ幅を内容に合わせる
+        p.style.maxWidth = '80%'; // 最大幅
+        p.style.textAlign = 'left'; // 背景内のテキストは左揃え
+        p.innerHTML = `<strong>あなた:</strong><br>${escapedText.replace(/\n/g, '<br>')}`; // 改行を<br>に
+      } else if (sender === 'gemini') {
+        p.classList.add('has-background-light'); // Geminiの背景色
+        p.style.display = 'inline-block'; // 左寄せしつつ幅を内容に合わせる
+        p.style.maxWidth = '80%'; // 最大幅
+        p.innerHTML = `<strong>Gemini:</strong><br>${escapedText.replace(/\n/g, '<br>')}`; // 改行を<br>に
+      } else { // error
+        p.classList.add('has-text-danger'); // エラーテキスト色
+        p.textContent = text;
       }
 
-      input.disabled = false;
+      messageElement.appendChild(p);
+      chat.appendChild(messageElement);
+
+      if (wasScrolledToBottom) {
+        chat.scrollTop = chat.scrollHeight;
+      }
     }
   </script>
 </body>
