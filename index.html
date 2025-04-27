@@ -6,199 +6,374 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Gemini Chat</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.3/css/bulma.min.css">
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js";
+    import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js";
+    import { getFirestore, doc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyCae-RqBAA8KSVGAHvezUwDAMMBz2JXnDQ",
+      authDomain: "kkgs-32-test.firebaseapp.com",
+      databaseURL: "https://kkgs-32-test-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "kkgs-32-test",
+      storageBucket: "kkgs-32-test.firebasestorage.app",
+      messagingSenderId: "771966795884",
+      appId: "1:771966795884:web:df806b571ee6759c815849",
+      measurementId: "G-J4TJZYY4J8"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    let userApiKey = "";
+    let conversationHistory = [];
+
+    const loginPromptContainer = document.getElementById("loginPromptContainer");
+    const redirectProgress = document.getElementById("redirectProgress");
+    const chatSection = document.getElementById("chatSection");
+    const userInfo = document.getElementById("userInfo");
+    const chat = document.getElementById("chat");
+    const messageInput = document.getElementById("messageInput");
+    const sendButton = document.getElementById("sendButton");
+
+    const DB_NAME = "geminiChatDB";
+    const STORE_NAME = "conversations";
+    let indexedDBInstance;
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 1);
+        request.onupgradeneeded = (event) => {
+          const db = event.target.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+          }
+        };
+        request.onsuccess = (event) => {
+          indexedDBInstance = event.target.result;
+          console.log("Database opened successfully");
+          resolve(indexedDBInstance);
+        };
+        request.onerror = (event) => {
+          console.error("Database error:", event.target.errorCode);
+          reject(event.target.errorCode);
+        };
+      });
+    }
+    function saveHistoryToDB(history) {
+      return new Promise((resolve, reject) => {
+        if (!indexedDBInstance) return reject("DB not open");
+        const transaction = indexedDBInstance.transaction([STORE_NAME], "readwrite");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.put({ id: 'current', history: history });
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event.target.error);
+      });
+    }
+    function loadHistoryFromDB() {
+      return new Promise((resolve, reject) => {
+        if (!indexedDBInstance) return reject("DB not open");
+        const transaction = indexedDBInstance.transaction([STORE_NAME], "readonly");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.get('current');
+        request.onsuccess = (event) => resolve(event.target.result ? event.target.result.history : []);
+        request.onerror = (event) => reject(event.target.error);
+      });
+    }
+    function clearHistoryFromDB() {
+      return new Promise((resolve, reject) => {
+        if (!indexedDBInstance) return reject("DB not open");
+        const transaction = indexedDBInstance.transaction([STORE_NAME], "readwrite");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.delete('current');
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event.target.error);
+      });
+    }
+
+    let redirectTimeoutId = null;
+    let progressIntervalId = null;
+    onAuthStateChanged(auth, async (user) => {
+      if (redirectTimeoutId) {
+        clearTimeout(redirectTimeoutId);
+        redirectTimeoutId = null;
+      }
+      if (progressIntervalId) {
+        clearInterval(progressIntervalId);
+        progressIntervalId = null;
+        redirectProgress.value = 0;
+        redirectProgress.removeAttribute('value');
+      }
+
+      if (user) {
+        console.log("User is signed in:", user.email);
+        loginPromptContainer.classList.add('is-hidden');
+        chatSection.classList.remove('is-hidden');
+        userInfo.textContent = `ログイン中: ${user.email}`;
+        messageInput.disabled = true;
+        sendButton.disabled = true;
+
+        try {
+          await openDB();
+          console.log("DB ready");
+
+          const apiKey = await getApiKeyFromFirestore();
+          if (apiKey) {
+            userApiKey = apiKey;
+            console.log("API Key loaded from Firestore.");
+            messageInput.disabled = false;
+            sendButton.disabled = false;
+            messageInput.focus();
+
+            conversationHistory = await loadHistoryFromDB();
+            conversationHistory.forEach(msg => {
+              const sender = msg.role === 'user' ? 'user' : 'gemini';
+              if (msg.parts && msg.parts.length > 0 && msg.parts[0].text) {
+                appendMessage(msg.parts[0].text, sender, false);
+              }
+            });
+            chat.scrollTop = chat.scrollHeight;
+
+          } else {
+            appendMessage("エラー: Gemini APIキーの取得に失敗しました。管理者に連絡してください。", 'error');
+            console.error("Failed to retrieve API Key from Firestore.");
+            messageInput.disabled = true;
+            sendButton.disabled = true;
+          }
+        } catch (error) {
+          console.error("Initialization or DB error after login:", error);
+          appendMessage("エラー: チャットの初期化中に問題が発生しました。", 'error');
+          messageInput.disabled = true;
+          sendButton.disabled = true;
+        }
+
+      } else {
+        console.log("User is signed out.");
+        chatSection.classList.add('is-hidden');
+        loginPromptContainer.classList.remove('is-hidden');
+        userApiKey = "";
+        conversationHistory = [];
+        chat.innerHTML = '';
+        messageInput.value = '';
+
+        const redirectDelay = 5000;
+        let startTime = Date.now();
+        redirectProgress.value = 0;
+        redirectProgress.max = redirectDelay;
+
+        progressIntervalId = setInterval(() => {
+          const elapsedTime = Date.now() - startTime;
+          redirectProgress.value = elapsedTime;
+          if (elapsedTime >= redirectDelay) {
+            clearInterval(progressIntervalId);
+          }
+        }, 100);
+
+        console.log(`Redirecting to login page in ${redirectDelay / 1000} seconds...`);
+        redirectTimeoutId = setTimeout(() => {
+          window.location.href = '/index.html';
+        }, redirectDelay);
+      }
+    });
+
+    async function getApiKeyFromFirestore() {
+      try {
+        const docRef = doc(db, "gemini", "api");
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (data && data.apiKey) {
+            return data.apiKey;
+          } else {
+            console.error("API key field not found in Firestore document.");
+            return null;
+          }
+        } else {
+          console.error("Firestore document 'gemini/api' does not exist.");
+          return null;
+        }
+      } catch (error) {
+        console.error("Error getting API key from Firestore:", error);
+        return null;
+      }
+    }
+
+    async function startNewChat() {
+      conversationHistory = [];
+      chat.innerHTML = '';
+      messageInput.value = '';
+      messageInput.disabled = !userApiKey;
+      sendButton.disabled = !userApiKey;
+      sendButton.classList.remove('is-loading');
+      try {
+        await clearHistoryFromDB();
+        console.log("Started new chat, history cleared.");
+      } catch (error) {
+        console.error("Failed to clear DB for new chat:", error);
+        alert("チャット履歴のクリアに失敗しました。");
+      }
+      if (userApiKey) {
+        messageInput.focus();
+      }
+    }
+    function handleKeyDown(event) {
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        sendMessage();
+      }
+    }
+    async function sendMessage() {
+      const msg = messageInput.value.trim();
+      if (!userApiKey || !msg || !indexedDBInstance) {
+        if (!userApiKey) console.error("API Key is missing.");
+        if (!msg) console.warn("Message is empty.");
+        if (!indexedDBInstance) console.error("IndexedDB is not ready.");
+        return;
+      }
+      const userMessage = { role: "user", parts: [{ text: msg }] };
+      appendMessage(msg, 'user');
+      messageInput.value = "";
+      messageInput.disabled = true;
+      sendButton.classList.add('is-loading');
+      sendButton.disabled = true;
+      conversationHistory.push(userMessage);
+      try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${userApiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: conversationHistory })
+        });
+        let responseText = "";
+        if (!res.ok) {
+          let errorData;
+          try { errorData = await res.json(); } catch (e) { errorData = { error: { message: `HTTPエラー: ${res.status}` } }; }
+          const errorMessage = errorData?.error?.message || '不明なAPIエラー';
+          console.error("API Error:", errorData);
+          appendMessage(`エラー: ${errorMessage}`, 'error');
+          conversationHistory.pop();
+        } else {
+          const data = await res.json();
+          if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
+            responseText = data.candidates[0].content.parts[0].text;
+          } else if (data.promptFeedback?.blockReason) {
+            responseText = `メッセージの処理中に問題が発生しました。(${data.promptFeedback.blockReason})`;
+            console.warn("Message processing issue:", data.promptFeedback);
+          } else {
+            responseText = "(有効な返答を取得できませんでした)";
+            console.warn("Unexpected API response structure:", data);
+          }
+          appendMessage(responseText, 'gemini');
+          if (responseText !== "(有効な返答を取得できませんでした)" && !data.promptFeedback?.blockReason) {
+            const modelMessage = { role: "model", parts: [{ text: responseText }] };
+            conversationHistory.push(modelMessage);
+            await saveHistoryToDB(conversationHistory);
+          }
+        }
+      } catch (e) {
+        console.error("Fetch Error:", e);
+        appendMessage(`エラー: APIリクエストに失敗しました。ネットワーク接続を確認してください。`, 'error');
+        conversationHistory.pop();
+      } finally {
+        messageInput.disabled = false;
+        sendButton.classList.remove('is-loading');
+        sendButton.disabled = false;
+        messageInput.focus();
+        messageInput.style.height = 'auto';
+        messageInput.rows = 3;
+      }
+    }
+    function appendMessage(text, sender, shouldScroll = true) {
+      const wasScrolledToBottom = chat.scrollHeight - chat.clientHeight <= chat.scrollTop + 5;
+      const messageElement = document.createElement('div');
+      messageElement.classList.add('mb-2');
+      const p = document.createElement('p');
+      p.classList.add('p-2', 'is-size-7');
+      p.style.wordBreak = 'break-word';
+      p.style.whiteSpace = 'pre-wrap';
+      p.style.borderRadius = '8px';
+      const lines = text.split('\n');
+      const content = lines.map(line => document.createTextNode(line));
+      if (sender === 'user') {
+        messageElement.classList.add('has-text-right');
+        p.classList.add('has-background-info-light');
+        p.style.display = 'inline-block'; p.style.maxWidth = '80%'; p.style.textAlign = 'left';
+        const strong = document.createElement('strong'); strong.textContent = 'あなた:';
+        p.appendChild(strong); p.appendChild(document.createElement('br'));
+        content.forEach((node, index) => { p.appendChild(node); if (index < content.length - 1) p.appendChild(document.createElement('br')); });
+      } else if (sender === 'gemini') {
+        messageElement.classList.add('has-text-left');
+        p.classList.add('has-background-light');
+        p.style.display = 'inline-block'; p.style.maxWidth = '80%';
+        const strong = document.createElement('strong'); strong.textContent = 'Gemini:';
+        p.appendChild(strong); p.appendChild(document.createElement('br'));
+        content.forEach((node, index) => { p.appendChild(node); if (index < content.length - 1) p.appendChild(document.createElement('br')); });
+      } else {
+        messageElement.classList.add('has-text-left');
+        p.classList.add('has-text-danger', 'has-background-danger-light');
+        p.style.display = 'inline-block'; p.style.maxWidth = '90%';
+        p.textContent = text;
+      }
+      messageElement.appendChild(p);
+      chat.appendChild(messageElement);
+      if (shouldScroll && (wasScrolledToBottom || sender === 'user')) {
+        chat.scrollTop = chat.scrollHeight;
+      }
+    }
+
+    window.sendMessage = sendMessage;
+    window.startNewChat = startNewChat;
+    window.handleKeyDown = handleKeyDown;
+  </script>
+  <style>
+    #chat {
+      scroll-behavior: smooth;
+    }
+
+    #loginPromptContainer {
+      margin-top: 5rem;
+    }
+  </style>
 </head>
 
 <body>
   <section class="section">
     <div class="container">
-      <h1 class="title">Gemini Chat</h1>
-
-      <!-- APIキー入力フォーム -->
-      <div id="keySection">
-        <div class="field">
-          <label class="label">Gemini APIキー</label>
-          <div class="control">
-            <input class="input" type="password" id="apiKeyInput" placeholder="あなたのAPIキーを入力">
-          </div>
-        </div>
-        <button class="button is-link" onclick="saveApiKey()">開始する</button>
+      <div id="loginPromptContainer" class="has-text-centered is-hidden">
+        <h1 class="title">ログインが必要です</h1>
+        <p class="subtitle">Gemini Chat を利用するには、まずトップページでログインしてください。</p>
+        <p>5秒後に自動的にトップページへ移動します...</p>
+        <progress class="progress is-small is-primary mt-3" max="100" id="redirectProgress">15%</progress>
+        <a href="https://kkgs-32-test.web.app" class="button is-link is-outlined mt-4">トップページへ移動</a>
       </div>
-
-      <!-- チャットUI -->
       <div id="chatSection" class="is-hidden">
-        <div id="chat" class="box mb-3" style="height: 500px; overflow-y: auto;"></div>
-        <!-- 入力エリアの構成を変更 -->
+        <div class="is-flex is-justify-content-space-between is-align-items-center mb-2">
+          <div>
+            <h1 class="title" style="margin-bottom: 0;">Gemini Chat</h1>
+            <p class="has-text-grey-light is-size-7">Powered by Gemini API (by Google).</p>
+          </div>
+        </div>
+        <p class="is-size-7 mb-3" id="userInfo"></p>
+        <div id="chat" class="box mb-3" style="height: 400px; overflow-y: auto;"></div>
         <div class="field">
           <div class="control">
-            <!-- input を textarea に変更 -->
             <textarea id="messageInput" class="textarea" placeholder="メッセージを入力… (Shift+Enterで改行)" rows="3"
-              onkeydown="handleKeyDown(event)"></textarea>
+              onkeydown="handleKeyDown(event)" disabled></textarea>
           </div>
         </div>
-        <div class="field is-grouped is-grouped-right">
+        <div class="is-flex is-justify-content-space-between is-align-items-center">
+          <button class="button is-warning is-outlined" onclick="startNewChat()">新しいチャット</button>
+          <button id="sendButton" class="button is-info is-outlined" onclick="sendMessage()" disabled>送信</button>
+        </div>
+        <hr>
+        <div class="field is-grouped mt-4">
           <div class="control">
-            <button id="sendButton" class="button is-info" onclick="sendMessage()">送信</button>
+            <a class="button is-primary is-outlined" href="https:kkgs-32-test.web.app">トップへ</a>
           </div>
         </div>
-        <!-- APIキーリセットボタン -->
-        <button class="button is-danger is-light mt-4" onclick="resetApiKey()">APIキーをリセット</button>
       </div>
     </div>
   </section>
-
-  <script>
-    let userApiKey = "";
-    let conversationHistory = [];
-
-    // --- DOM要素の取得を最初に行う ---
-    const keySection = document.getElementById("keySection");
-    const chatSection = document.getElementById("chatSection");
-    const apiKeyInput = document.getElementById("apiKeyInput");
-    const chat = document.getElementById("chat");
-    const messageInput = document.getElementById("messageInput");
-    const sendButton = document.getElementById("sendButton"); // ボタンにIDを付与して取得
-
-    window.onload = () => {
-      const savedKey = localStorage.getItem("geminiApiKey");
-      if (savedKey) {
-        userApiKey = savedKey;
-        showChatUI();
-      } else {
-        keySection.classList.remove("is-hidden");
-      }
-    };
-
-    function saveApiKey() {
-      const inputKey = apiKeyInput.value;
-      if (!inputKey) {
-        alert("APIキーを入力してください");
-        return;
-      }
-      userApiKey = inputKey;
-      localStorage.setItem("geminiApiKey", userApiKey);
-      showChatUI();
-    }
-
-    function resetApiKey() {
-      localStorage.removeItem("geminiApiKey");
-      conversationHistory = [];
-      location.reload();
-    }
-
-    function showChatUI() {
-      keySection.classList.add("is-hidden");
-      chatSection.classList.remove("is-hidden");
-      messageInput.focus(); // チャット表示時にフォーカス
-    }
-
-    function handleKeyDown(event) {
-      // --- Enter送信、Shift+Enter改行の処理 ---
-      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-        event.preventDefault(); // TextareaでのEnterキー既定の改行動作をキャンセル
-        sendMessage();
-      }
-      // Shift+Enterの場合は通常の改行動作
-    }
-
-    async function sendMessage() {
-      const msg = messageInput.value.trim();
-
-      if (!msg) return;
-
-      // --- 見た目の変更: ユーザーメッセージ ---
-      appendMessage(msg, 'user');
-      messageInput.value = ""; // 送信後にクリア
-      messageInput.disabled = true;
-      sendButton.classList.add('is-loading');
-
-      conversationHistory.push({ role: "user", parts: [{ text: msg }] });
-
-      try {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${userApiKey}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: conversationHistory
-          })
-        });
-
-        let responseText = ""; // 応答テキストを格納する変数
-
-        if (!res.ok) {
-          let errorData;
-          try {
-            errorData = await res.json();
-          } catch (e) {
-            errorData = { error: { message: `HTTPエラー: ${res.status}` } };
-          }
-          const errorMessage = errorData?.error?.message || '不明なAPIエラー';
-          console.error("API Error:", errorData);
-          // --- 見た目の変更: エラーメッセージ ---
-          appendMessage(`エラー: ${errorMessage}`, 'error');
-          conversationHistory.pop(); // エラー時はユーザーメッセージを履歴から削除
-        } else {
-          const data = await res.json();
-          // --- 安全な応答の取得 ---
-          responseText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "(返答なし)";
-          // --- 見た目の変更: Geminiメッセージ ---
-          appendMessage(responseText, 'gemini');
-          conversationHistory.push({ role: "model", parts: [{ text: responseText }] });
-        }
-
-      } catch (e) {
-        console.error("Fetch Error:", e);
-        // --- 見た目の変更: エラーメッセージ ---
-        appendMessage(`エラー: APIリクエストに失敗しました。ネットワーク接続を確認してください。`, 'error');
-        conversationHistory.pop(); // エラー時はユーザーメッセージを履歴から削除
-      } finally {
-        messageInput.disabled = false;
-        sendButton.classList.remove('is-loading');
-        messageInput.focus();
-        // 送信後にTextareaの高さをリセット（任意）
-        messageInput.style.height = 'auto';
-        messageInput.rows = 3; // 初期行数に戻すなど
-      }
-    }
-
-    // --- appendMessage関数を役割に応じて変更 ---
-    function appendMessage(text, sender) {
-      const wasScrolledToBottom = chat.scrollHeight - chat.clientHeight <= chat.scrollTop + 1;
-
-      const messageElement = document.createElement('div');
-      messageElement.classList.add('mb-2'); // メッセージ間のマージン
-
-      const p = document.createElement('p');
-      p.classList.add('p-2'); // パディング
-      p.style.wordBreak = 'break-word'; // 長い単語の折り返し
-
-      // HTMLエスケープ (簡易版: < と > のみ)
-      const escapedText = text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-      if (sender === 'user') {
-        messageElement.classList.add('has-text-right'); // 右寄せ
-        p.classList.add('has-background-info-light'); // ユーザーの背景色
-        p.style.display = 'inline-block'; // 右寄せしつつ幅を内容に合わせる
-        p.style.maxWidth = '80%'; // 最大幅
-        p.style.textAlign = 'left'; // 背景内のテキストは左揃え
-        p.innerHTML = `<strong>あなた:</strong><br>${escapedText.replace(/\n/g, '<br>')}`; // 改行を<br>に
-      } else if (sender === 'gemini') {
-        p.classList.add('has-background-light'); // Geminiの背景色
-        p.style.display = 'inline-block'; // 左寄せしつつ幅を内容に合わせる
-        p.style.maxWidth = '80%'; // 最大幅
-        p.innerHTML = `<strong>Gemini:</strong><br>${escapedText.replace(/\n/g, '<br>')}`; // 改行を<br>に
-      } else { // error
-        p.classList.add('has-text-danger'); // エラーテキスト色
-        p.textContent = text;
-      }
-
-      messageElement.appendChild(p);
-      chat.appendChild(messageElement);
-
-      if (wasScrolledToBottom) {
-        chat.scrollTop = chat.scrollHeight;
-      }
-    }
-  </script>
 </body>
 
 </html>
